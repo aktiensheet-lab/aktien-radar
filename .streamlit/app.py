@@ -3,24 +3,22 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import yfinance as yf
-import pandas_ta as ta
 import requests
 import feedparser
 
-# ------------------ Seiteneinstellungen ------------------
+# ------------------ Streamlit-Setup ------------------
 st.set_page_config(page_title="Aktien-Radar", layout="wide")
 st.title("📈 Aktien-Radar – Fundamentaldaten • Technik • News (Ampelsystem)")
 st.caption("Weltweit • Kostenlos • Telegram-Push optional • Empfehlung: Kaufen / Halten / Verkaufen")
 
-# ------------------ Secrets / Umgebungsvariablen ------------------
+# ------------------ Secrets (für Telegram) ------------------
 TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))
 TELEGRAM_CHAT_ID   = st.secrets.get("TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))
 
-# ------------------ Ampel-Helfer ------------------
+# ------------------ Ampel-UI ------------------
 def ampel(color, text=""):
     colors = {"green":"#16a34a","yellow":"#eab308","red":"#dc2626","grey":"#9ca3af"}
     c = colors.get(color, "#9ca3af")
-    label = f"&nbsp;{text}" if text else ""
     return f"""
     <span style="display:inline-flex;align-items:center">
       <span style="width:10px;height:10px;border-radius:9999px;background:{c};display:inline-block;margin-right:6px;border:1px solid rgba(0,0,0,.05)"></span>
@@ -28,21 +26,43 @@ def ampel(color, text=""):
     </span>
     """
 
-# ------------------ Bewertungsregeln (evidenzbasiert, robust) ------------------
+# ------------------ Technische Indikatoren (stabil, ohne Zusatzpakete) ------------------
+def ema(series: pd.Series, span: int):
+    return series.ewm(span=span, adjust=False).mean()
+
+def rsi(series: pd.Series, period: int = 14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = roll_up / roll_down
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
+
+def macd(series: pd.Series):
+    ema12 = ema(series, 12)
+    ema26 = ema(series, 26)
+    macd_line = ema12 - ema26
+    signal = ema(macd_line, 9)
+    hist = macd_line - signal
+    return macd_line, signal, hist
+
+# ------------------ Evidenzbasierte Schwellen (Ampel) ------------------
 def grade_pe(pe):
-    if not pe or pe<=0 or math.isnan(pe): return "grey"
+    if pe is None or (isinstance(pe,float) and (math.isnan(pe) or pe<=0)): return "grey"
     if pe<=15: return "green"
     if pe<=25: return "yellow"
     return "red"
 
 def grade_pb(pb):
-    if not pb or pb<=0 or math.isnan(pb): return "grey"
+    if pb is None or (isinstance(pb,float) and (math.isnan(pb) or pb<=0)): return "grey"
     if pb<=2.5: return "green"
     if pb<=4.0: return "yellow"
     return "red"
 
 def grade_ev_ebitda(x):
-    if not x or x<=0 or math.isnan(x): return "grey"
+    if x is None or (isinstance(x,float) and (math.isnan(x) or x<=0)): return "grey"
     if x<=10: return "green"
     if x<=14: return "yellow"
     return "red"
@@ -63,14 +83,14 @@ def grade_margin(m):
 
 def grade_growth(g):
     if g is None or (isinstance(g,float) and math.isnan(g)): return "grey"
-    g = g*100 if g<2 else g
+    g = g*100 if abs(g)<2 else g
     if g>=10: return "green"
     if g>=0: return "yellow"
     return "red"
 
 def grade_nd_ebitda(x):
     if x is None or (isinstance(x,float) and math.isnan(x)): return "grey"
-    if x<=0: return "green"  # Net Cash
+    if x<=0: return "green"
     if x<=2.0: return "green"
     if x<=3.0: return "yellow"
     return "red"
@@ -129,24 +149,14 @@ def grade_news_sentiment(s):
 
 WEIGHTS = dict(value=0.40, quality=0.20, growth=0.10, technical=0.20, news=0.10)
 
-# ------------------ Daten-Lader ------------------
+# ------------------ Daten laden ------------------
 @st.cache_data(ttl=3600)
 def load_universe():
     try:
         df = pd.read_csv("universe.csv").dropna()
         return sorted(list(set(df["symbol"].astype(str).str.strip())))
     except Exception:
-        return ["AAPL","MSFT","NVDA","AMZN","META","GOOGL"]
-
-@st.cache_data(ttl=3600)
-def load_watchlist():
-    if os.path.exists("watchlist.txt"):
-        with open("watchlist.txt","r",encoding="utf-8") as f:
-            return list(sorted(set([x.strip() for x in f if x.strip()])))
-    return []
-
-UNIVERSE = load_universe()
-WATCHLIST = load_watchlist()
+        return ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","SAP.DE","ASML.AS","NESN.SW"]
 
 @st.cache_data(ttl=900)
 def get_prices(tickers, period="2y", interval="1d"):
@@ -194,27 +204,30 @@ def get_fundamentals(tickers):
             netDebtToEbitda=nd_ebitda,
             fcfYield=fcf_yield
         ))
-        time.sleep(0.05)
+        time.sleep(0.03)
     return pd.DataFrame(rows)
 
-def compute_technicals(price_df_for_symbol):
-    close = price_df_for_symbol.get("Close", pd.Series(dtype=float)).dropna()
-    if close.empty:
-        return dict(price=None, sma50=None, sma200=None, rsi=None, mom_12_1=None, pct_from_52w_high=None)
+def compute_technicals(close: pd.Series):
+    if close is None or close.empty:
+        return dict(price=None, sma50=None, sma200=None, rsi=None, macd=None, mom_12_1=None, pct_from_52w_high=None)
     sma50 = close.rolling(50).mean().iloc[-1] if len(close)>=50 else None
     sma200 = close.rolling(200).mean().iloc[-1] if len(close)>=200 else None
-    rsi = ta.rsi(close, length=14).iloc[-1] if len(close)>=14 else None
-    # Momentum 12-1 (letzter Monat ausgeschlossen)
+    rsi_val = rsi(close, 14).iloc[-1] if len(close)>=15 else None
+    macd_line, sig, hist = macd(close) if len(close)>=26 else (pd.Series(dtype=float),pd.Series(dtype=float),pd.Series(dtype=float))
+    macd_up = (macd_line.iloc[-1] > 0) if len(macd_line)>0 else None
+    # Momentum 12-1
     try:
         monthly = close.resample("M").last()
-        r_12 = monthly.iloc[-2]/monthly.iloc[-13] - 1.0 if len(monthly)>=13 else None
+        mom_12_1 = monthly.iloc[-2]/monthly.iloc[-13] - 1.0 if len(monthly)>=13 else None
     except Exception:
-        r_12 = None
+        mom_12_1 = None
+    # 52W hoch Abstand
     pct_from_high = None
     if len(close)>=252:
         high_52w = close[-252:].max()
         pct_from_high = (high_52w - close.iloc[-1]) / high_52w * 100.0
-    return dict(price=close.iloc[-1], sma50=sma50, sma200=sma200, rsi=rsi, mom_12_1=r_12, pct_from_52w_high=pct_from_high)
+    return dict(price=close.iloc[-1], sma50=sma50, sma200=sma200, rsi=rsi_val, macd_up=macd_up,
+                mom_12_1=mom_12_1, pct_from_52w_high=pct_from_high)
 
 # ------------------ News (kostenlos via Google News RSS) ------------------
 def fetch_news_google_rss(query, limit=3):
@@ -224,7 +237,7 @@ def fetch_news_google_rss(query, limit=3):
         feed = feedparser.parse(url)
         items = []
         for e in feed.entries[:limit]:
-            items.append(dict(title=e.title, url=e.link, published_at=getattr(e, "published", None), sentiment=None))
+            items.append(dict(title=e.title, url=e.link, published_at=getattr(e, "published", "")))
         return items
     except Exception:
         return []
@@ -239,7 +252,7 @@ def simple_headline_sentiment(title: str):
         if w in t: score += 1
     for w in neg_kw:
         if w in t: score -= 1
-    return max(-1.0, min(1.0, score/3.0))  # -1..+1
+    return max(-1.0, min(1.0, score/3.0))
 
 # ------------------ Scoring ------------------
 def score_row(f_row, t_row, news_items):
@@ -274,11 +287,10 @@ def score_row(f_row, t_row, news_items):
         {"green":1,"yellow":0,"red":-1,"grey":0}[grade_trend_sma(t_row.get("sma50"), t_row.get("sma200"))],
         {"green":1,"yellow":0,"red":-1,"grey":0}[grade_price_vs_200d(t_row.get("price"), t_row.get("sma200"))],
         {"green":1,"yellow":0,"red":-1,"grey":0}[grade_mom_12_1(t_row.get("mom_12_1"))],
-        {"green":1,"yellow":0,"red":-1,"grey":0}[grade_rsi(t_row.get("rsi"))],
-        {"green":1,"yellow":0,"red":-1,"grey":0}[grade_52w_near(t_row.get("pct_from_52w_high"))]
+        {"green":1,"yellow":0,"red":-1,"grey":0}[grade_rsi(t_row.get("rsi"))]
     ])
 
-    # News-Sentiment (einfach): Mittel der Regel-Keywords
+    # News-Sentiment
     if news_items:
         sentiments = [simple_headline_sentiment(x["title"]) for x in news_items if x.get("title")]
         s_avg = float(np.mean(sentiments)) if sentiments else 0.0
@@ -291,10 +303,7 @@ def score_row(f_row, t_row, news_items):
              WEIGHTS["news"]*g_news)
 
     rec = "Kaufen" if total>=0.5 else ("Verkaufen" if total<=-0.5 else "Halten")
-
-    return dict(g_value=g_value, g_quality=g_quality, g_growth=g_growth,
-                g_technical=g_trend, g_news=g_news, total=total,
-                recommendation=rec, news_sentiment=s_avg)
+    return dict(total=total, recommendation=rec, news_sentiment=s_avg)
 
 # ------------------ Sidebar ------------------
 with st.sidebar:
@@ -314,41 +323,51 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Telegram-Fehler: {e}")
         else:
-            st.error("Bitte TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID als Secrets setzen (siehe Anleitung).")
+            st.error("Bitte TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID als Secrets setzen (⋯ → Settings → Secrets).")
 
 if auto_refresh:
     st.experimental_set_query_params(refresh=str(int(time.time())//300))
 
-# ------------------ Universe erstellen ------------------
-symbols = load_universe()
+# ------------------ Universe ------------------
+@st.cache_data(ttl=3600)
+def load_symbols(universe_file="universe.csv"):
+    try:
+        df = pd.read_csv(universe_file)
+        syms = [s.strip() for s in df["symbol"].dropna().astype(str)]
+        return sorted(list(set(syms)))
+    except Exception:
+        return ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","SAP.DE","ASML.AS","NESN.SW"]
+
+symbols = load_symbols()
 if custom_symbols.strip():
     extra = [s.strip() for s in custom_symbols.split(",") if s.strip()]
     symbols = sorted(list(set(symbols + extra)))
 
 st.write(f"**Universe geladen:** {len(symbols)} Symbole")
 
-# ------------------ Daten abrufen ------------------
+# ------------------ Kurse & Fundamentals holen ------------------
 prices = get_prices(symbols, period="2y", interval="1d")
 fundamentals = get_fundamentals(symbols).set_index("symbol")
 
-# Technische Kennzahlen
-rows = []
+# ------------------ Technische Kennzahlen berechnen ------------------
+tech_rows = []
 for t in symbols:
     try:
         df_t = prices[t]
+        close = df_t["Close"].dropna()
     except Exception:
-        df_t = pd.DataFrame()
-    tech = compute_technicals(df_t) if not df_t.empty else dict(price=None,sma50=None,sma200=None,rsi=None,mom_12_1=None,pct_from_52w_high=None)
-    rows.append(pd.Series(tech, name=t))
-technicals = pd.DataFrame(rows)
+        close = pd.Series(dtype=float)
+    tech = compute_technicals(close)
+    tech_rows.append(pd.Series(tech, name=t))
+technicals = pd.DataFrame(tech_rows)
 
-# News (kostenlos, 3 Schlagzeilen)
+# ------------------ News sammeln ------------------
 news_map = {}
 for t in symbols:
     items = fetch_news_google_rss(f'"{t}" stock OR Aktie', limit=3)
     news_map[t] = items
 
-# Scoring + Tabelle
+# ------------------ Scoring & Tabelle ------------------
 records = []
 for t in symbols:
     f_row = fundamentals.loc[t].to_dict() if t in fundamentals.index else {}
@@ -371,6 +390,7 @@ for t in symbols:
         t_sma50=t_row.get("sma50"), t_sma200=t_row.get("sma200"),
         t_rsi=t_row.get("rsi"), t_mom12_1=t_row.get("mom_12_1"),
         t_52w_gap=t_row.get("pct_from_52w_high"),
+        macd_up=t_row.get("macd_up"),
         news_sent=sc["news_sentiment"],
         score_total=sc["total"], recommendation=sc["recommendation"],
         news_items=n_items
@@ -405,6 +425,7 @@ display = pd.DataFrame({
     "Momentum 12-1": [ampel(grade_mom_12_1(x), fmt_num(x, pct=True)) for x in df["t_mom12_1"]],
     "RSI(14)": [ampel(grade_rsi(x), f"{x:.0f}" if pd.notna(x) else "—") for x in df["t_rsi"]],
     "52W-Hoch Dist.": [ampel(grade_52w_near(x), fmt_num(x, pct=True)) for x in df["t_52w_gap"]],
+    "MACD": [ampel("green" if x is True else ("red" if x is False else "grey")) for x in df["macd_up"]],
     "News-Sent.": [ampel(grade_news_sentiment(x), f"{x:+.2f}") for x in df["news_sent"]],
     "Gesamt": df["score_total"].map(lambda v: f"{v:+.2f}"),
     "Empfehlung": df["recommendation"]
